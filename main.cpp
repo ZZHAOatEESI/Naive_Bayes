@@ -10,6 +10,7 @@
 #include "Diskutil.hpp"
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 #include <boost/program_options.hpp>
 using namespace std;
 namespace p_opt = boost::program_options;
@@ -22,15 +23,18 @@ const string KMER_EXTEN(".kmr");
 const string PROG_VER("NB v. 0.1.5a-dev.");
 const string DEF_SAVEDIR("./NB_save");
 
-void trainNB(NB &nb, path srcdir, string extension, int nbatch,
-             int memoryLimit){
-  int count = 1, counter = 0, usedMemory = 0;
+void trainNB(NB &nb, path srcdir, string extension, unsigned int nbatch,
+             uint64_t memoryLimit){
+  unsigned int count = 1, counter = 0;
+  uint64_t usedMemory = 0;
   vector<tuple<string, path, path> > result =
     Diskutil::getTrainingGenomePaths(srcdir, extension);
   string cls_s="-1"; Class<int> *current = NULL;
   for(vector<tuple<string, path, path> >::iterator iter = result.begin();
       iter != result.end(); iter++, counter++){
-        int savefileSize = 0;
+
+        unsigned int savefileSize = 0;
+
         bool loadedNewClass = false;
         
         // FASTA files not needed for training, so just add up the kmr file size
@@ -56,7 +60,7 @@ void trainNB(NB &nb, path srcdir, string extension, int nbatch,
           loadedNewClass = true;
         }
 
-        if(memoryLimit != -1 && usedMemory + genomeSize + savefileSize> memoryLimit){
+        if(memoryLimit != 0 && usedMemory + genomeSize + savefileSize> memoryLimit){
           nb.processClassUpdates();
           usedMemory = 0;
           cls_s = "-1"; // This will force the next iteration to add this savefile's size again
@@ -70,7 +74,7 @@ void trainNB(NB &nb, path srcdir, string extension, int nbatch,
         }
         usedMemory += genomeSize;
 
-        if(nbatch != -1 && counter % nbatch == 0){
+        if(nbatch != 0 && counter % nbatch == 0){
           nb.processClassUpdates();
         }
       }
@@ -81,16 +85,31 @@ void trainNB(NB &nb, path srcdir, string extension, int nbatch,
 int printClassifierResults(vector<Genome*> reads,
                            vector<tuple<string, path, path> > result){
 
-  int correct=0, total = reads.size();
+
+  unsigned int correct=0, total = reads.size();
   
   for(int i=0; i < total; i++){
-    //Genome::pqueue queue = reads[i]->getConfidences();
-    Genome::score score = reads[i]->getMaximum();
-    //string pred_class = queue.top().second->getId();
-    string pred_class = score.second->getId();
+    string pred_class;
+    double posterior, prior;
+    if (Genome::STORE_ALL_NUMERATORS) {
+      Genome::pqueue queue = reads[i]->getConfidences();
+
+      pred_class = queue.top().second->getId();
+      posterior = queue.top().first;
+    } else {
+      Genome::score score = reads[i]->getMaximum();
+      
+      pred_class = score.second->getId();
+      prior = score.first;
+    }    
 
     cout<<"Genome with class "<<get<0>(result[i]);
-    cout<<", predicted "<<pred_class<<'\n';//<<", score "<<queue.top().first<<'\n';
+    cout<<", predicted "<<pred_class;
+    if (Genome::STORE_ALL_NUMERATORS) {
+      cout<<", posterior: "<<posterior;
+    }
+    cout<<'\n';
+
     cout.flush();
 
     if(pred_class.compare(get<0>(result[i])) == 0){
@@ -120,19 +139,19 @@ int printClassifierResults(vector<Genome*> reads,
   return correct;
 }
 
-void classifyNB(NB &nb, path srcdir, string extension, int nbatch,
-                int memoryLimit){
+void classifyNB(NB &nb, path srcdir, string extension, unsigned int nbatch,
+                uint64_t memoryLimit){
   vector<tuple<string, path, path> > result =
     Diskutil::getTrainingGenomePaths(srcdir, extension);
   vector<Genome*> reads;
-  int correct=0, counter=0, usedMemory = 0, total = result.size();
+  unsigned int correct=0, counter=0, total = result.size();
+  uint64_t usedMemory = 0;
   for(vector<tuple<string, path, path> >::iterator iter =
     result.begin(); iter != result.end(); iter++, counter++){
 
-    int genomeSize = Diskutil::getFileSize(get<1>(*iter));
-    genomeSize += Diskutil::getFileSize(get<2>(*iter));
+    unsigned int genomeSize = Diskutil::getFileSize(get<1>(*iter));
 
-    if(memoryLimit != -1 && usedMemory + genomeSize > memoryLimit){
+    if(memoryLimit != 0 && usedMemory + genomeSize > memoryLimit){
       nb.classify(reads);
       correct += printClassifierResults(reads, result);
       usedMemory = 0;
@@ -141,7 +160,7 @@ void classifyNB(NB &nb, path srcdir, string extension, int nbatch,
       reads.clear();
     }
 
-    if(nbatch != -1 && counter != 0 && counter % nbatch == 0){
+    if(nbatch != 0 && counter != 0 && counter % nbatch == 0){
       nb.classify(reads);
       correct += printClassifierResults(reads, result);
       usedMemory = 0;
@@ -166,8 +185,10 @@ void classifyNB(NB &nb, path srcdir, string extension, int nbatch,
 }
 
 int main(int argc, char* argv[]){
-  int nbatch, nthreads, kmersize, memLimit;
+  unsigned int nbatch, nthreads, kmersize;
+  uint64_t memLimit;
   string kmer_ext, srcdir, mode, savedir;
+  bool print_posterior;
 
   p_opt::options_description generic("Generic options");
   generic.add_options()
@@ -183,19 +204,22 @@ int main(int argc, char* argv[]){
   visible.add_options()
     ("savedir,s", p_opt::value<string>(&savedir)->default_value(DEF_SAVEDIR),
                   "Path to save folder")
-    ("kmersize,k", p_opt::value<int>(&kmersize)->default_value(DEF_KMER_SIZE),
+    ("kmersize,k", p_opt::value<unsigned int>(&kmersize)->default_value(DEF_KMER_SIZE),
                    "Kmer size used in count files")
-    ("memlimit,m", p_opt::value<int>(&memLimit)->default_value(-1),
+    ("memlimit,m", p_opt::value<uint64_t>(&memLimit)->default_value(0),
                    "Cap memory use to a predefined value (KBs).")
-    ("nthreads,t", p_opt::value<int>(&nthreads)->default_value(1),
+    ("nthreads,t", p_opt::value<unsigned int>(&nthreads)->default_value(1),
                  "Number of threads to spawn, 1 by default")
     ("ext,e", p_opt::value<string>(&kmer_ext)->default_value(KMER_EXTEN),
             "Extension of kmer count files, \".kmr\" by default")
-    ("nbatch,n", p_opt::value<int>(&nbatch)->default_value(-1),
+    ("nbatch,n", p_opt::value<unsigned int>(&nbatch)->default_value(0),
                "Number of genomes to load at one time in memory, \
 all at once by default")
+    ("p_posterior,p", p_opt::value<bool>(&print_posterior)->default_value(Genome::STORE_ALL_NUMERATORS),
+               "Print posteriors for every classified read. This \
+flag increases the classifier's memory usage and is not compatible with the memory cap flag.")
   ;
-
+  
   p_opt::positional_options_description pos_args;
   pos_args.add("mode", 1);
   pos_args.add("srcdir", 1);
@@ -227,6 +251,7 @@ all at once by default")
   create_directories(savedir);
   NB nb(kmersize, path(savedir), nthreads);
   nb.debug_flag = NB::Debug::LOG_SOME;
+  Genome::STORE_ALL_NUMERATORS = print_posterior;
 
   if(mode.compare("train") == 0){
     cout<<"Train mode.\n";
